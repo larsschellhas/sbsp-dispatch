@@ -1,3 +1,5 @@
+import math
+from multiprocessing import Pool
 import os
 import pandas as pd
 from datetime import datetime
@@ -6,6 +8,8 @@ from collections import defaultdict
 import time
 import logging
 import sys
+
+from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(
@@ -64,6 +68,7 @@ def create_model(time_steps: list[datetime], markets: list[Market], total_power_
     logger.info(f"Basic sets creation: {time.time() - start_time:.2f} seconds")
 
     # Index Set creation
+    # Only includes market & time step pairs with non-zero prices, as the plant will not operate in those periods
     start_time = time.time()
     model.INDEX_SET = Set(initialize=[(t, m) for t in model.T for m in model.MARKETS if m.price_data[t] > 0], dimen=2)
     logger.info(f"INDEX_SET creation: {time.time() - start_time:.2f} seconds")
@@ -114,7 +119,7 @@ def create_model(time_steps: list[datetime], markets: list[Market], total_power_
     return model
 
 
-def run_optimization(time_steps: list[datetime], markets: list[Market], total_power_MW: float = 1.0) -> tuple[pd.DataFrame, pd.DataFrame]:
+def run_optimization(time_steps: list[datetime], markets: list[Market], total_power_MW: float = 1.0, verbose: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run optimization for a specific time period and set of markets.
     
     Args:
@@ -132,7 +137,7 @@ def run_optimization(time_steps: list[datetime], markets: list[Market], total_po
     model = create_model(time_steps, markets, total_power_MW)
     
     solver = SolverFactory('highs')
-    results = solver.solve(model, tee=True)
+    results = solver.solve(model, tee=verbose)
     logger.info(f"Optimization completed in {time.time() - start_time:.2f} seconds")
     
     if results.solver.status != 'ok' or results.solver.termination_condition != 'optimal':
@@ -171,14 +176,83 @@ def save_results(dispatch_results: pd.DataFrame, revenue_results: pd.DataFrame, 
     dispatch_file = os.path.join(output_dir, f"dispatch_results_{timestamp_start}-{timestamp_end}.csv")
     revenue_file = os.path.join(output_dir, f"revenue_results_{timestamp_start}-{timestamp_end}.csv")
     
-    # Save files
-    dispatch_results.to_csv(dispatch_file)
-    revenue_results.to_csv(revenue_file)
+    # Replace zeros with NaN and drop them
+    dispatch_results_clean = dispatch_results.replace(0, float('nan')).dropna(how='all').dropna(how='all', axis=1)
+    revenue_results_clean = revenue_results.replace(0, float('nan')).dropna(how='all').dropna(how='all', axis=1)
+    
+    dispatch_results_clean.to_csv(dispatch_file)
+    revenue_results_clean.to_csv(revenue_file)
+    
+    # Log reduction in size
+    dispatch_reduction = 100 * (1 - dispatch_results_clean.notna().sum().sum() / (dispatch_results.shape[0] * dispatch_results.shape[1]))
+    revenue_reduction = 100 * (1 - revenue_results_clean.notna().sum().sum() / (revenue_results.shape[0] * revenue_results.shape[1]))
     
     logger.info(f"Saved results to {output_dir} in {time.time() - start_time:.2f} seconds")
+    logger.info(f"Data reduction: Dispatch {dispatch_reduction:.1f}%, Revenue {revenue_reduction:.1f}%")
+
+def calculate_chunk_size(total_timesteps: int, num_markets: int, target_chunk_size: int = 50000) -> int:
+    """Calculate optimal chunk size based on total problem size and target chunk size.
+    
+    Args:
+        total_timesteps: Total number of timesteps
+        num_markets: Number of markets
+        target_chunk_size: Target size for each chunk (timesteps * markets)
+        
+    Returns:
+        Number of timesteps per chunk
+    """
+    # Calculate timesteps needed for target chunk size
+    timesteps_per_chunk = math.ceil(target_chunk_size / num_markets)
+    
+    # Ensure we don't create chunks larger than total timesteps
+    timesteps_per_chunk = min(timesteps_per_chunk, total_timesteps)
+    
+    # Adjust chunk size to create equal chunks
+    num_chunks = math.ceil(total_timesteps / timesteps_per_chunk)
+    timesteps_per_chunk = math.ceil(total_timesteps / num_chunks)
+    
+    return timesteps_per_chunk
+
+
+def create_time_chunks(time_steps: list[datetime], chunk_size: int) -> list[list[datetime]]:
+    """Split time_steps into chunks of specified size."""
+    return [time_steps[i:i + chunk_size] for i in range(0, len(time_steps), chunk_size)]
+
+
+def process_chunk(args: tuple, verbose: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Process a single chunk of time steps (wrapper for multiprocessing).
+    
+    Args:
+        args: Tuple of (chunk_time_steps, markets, total_power_MW)
+    """
+
+    if not verbose:
+        # Temporarily disable logging for this process
+        logging.getLogger().setLevel(logging.WARNING)
+
+    chunk_time_steps, markets, total_power_MW = args
+    return run_optimization(chunk_time_steps, markets, total_power_MW, verbose)
+
+
+def process_chunk_with_verbose(args_with_verbose: tuple) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Process chunk wrapper that handles verbose flag.
+    
+    Args:
+        args_with_verbose: Tuple of ((chunk_time_steps, markets, total_power_MW), verbose)
+    """
+    args, verbose = args_with_verbose
+    if not verbose:
+        # Temporarily disable logging for this process
+        logging.getLogger().setLevel(logging.WARNING)
+    
+    return process_chunk(args)
+
 
 if __name__ == "__main__":
     total_start_time = time.time()
+    
+    # Add verbose flag
+    verbose = False  # Set to True for detailed logging
     
     # Load market data
     logger.info("Loading market data...")
@@ -189,17 +263,42 @@ if __name__ == "__main__":
     # Filter markets and time steps
     start_time = time.time()
     # All markets['AT', 'BE', 'BG', 'CH', 'CZ', 'DE_AT_LU', 'DE_LU', 'DK_1', 'DK_2', 'EE', 'ES', 'FI', 'FR', 'GB', 'GR', 'HR', 'HU', 'IE_SEM', 'IT_BRNN', 'IT_CALA', 'IT_CNOR', 'IT_CSUD', 'IT_FOGN', 'IT_GR', 'IT_NORD', 'IT_NORD_AT', 'IT_NORD_CH', 'IT_NORD_FR', 'IT_NORD_SI', 'IT_PRGP', 'IT_ROSN', 'IT_SACO_AC', 'IT_SACO_DC', 'IT_SARD', 'IT_SICI', 'IT_SUD', 'LT', 'LV', 'ME', 'MK', 'NL', 'NO_1', 'NO_2', 'NO_2_NSL', 'NO_3', 'NO_4', 'NO_5', 'PL', 'PT', 'RO', 'RS', 'SE_1', 'SE_2', 'SE_3', 'SE_4', 'SI', 'SK', 'UA_BEI', 'UA_IPS'] 
-    filtered_markets = [m for m in markets if m.name in ['AT', 'BE', 'BG', 'CH', 'CZ', 'DE_AT_LU', 'DE_LU', 'DK_1', 'DK_2', 'EE', 'ES', 'FI', 'FR', 'GB', 'GR', 'HR', 'HU', 'IE_SEM', 'IT_BRNN', 'IT_CALA', 'IT_CNOR', 'IT_CSUD', 'IT_FOGN', 'IT_GR', 'IT_NORD', 'IT_NORD_AT', 'IT_NORD_CH', 'IT_NORD_FR', 'IT_NORD_SI', 'IT_PRGP', 'IT_ROSN', 'IT_SACO_AC', 'IT_SACO_DC', 'IT_SARD', 'IT_SICI', 'IT_SUD', 'LT', 'LV', 'ME', 'MK', 'NL', 'NO_1', 'NO_2', 'NO_2_NSL', 'NO_3', 'NO_4', 'NO_5', 'PL', 'PT', 'RO', 'RS', 'SE_1', 'SE_2', 'SE_3', 'SE_4', 'SI', 'SK']] 
-    filtered_time_steps = [t for t in time_steps if (t.year == 2024 and t.month > 11)]
+    filtered_markets = [m for m in markets if m.name in ['AT', 'BE', 'BG', 'CH', 'CZ', 'DE_AT_LU', 'DE_LU', 'DK_1', 'DK_2', 'EE', 'ES', 'FI', 'FR', 'GB', 'GR', 'HR', 'HU', 'IE_SEM', 'IT_BRNN', 'IT_CALA', 'IT_CNOR', 'IT_CSUD', 'IT_FOGN', 'IT_GR', 'IT_NORD', 'IT_NORD_AT', 'IT_NORD_CH', 'IT_NORD_FR', 'IT_NORD_SI', 'IT_PRGP', 'IT_ROSN', 'IT_SACO_AC', 'IT_SACO_DC', 'IT_SARD', 'IT_SICI', 'IT_SUD', 'LT', 'LV', 'ME', 'MK', 'NL', 'NO_1', 'NO_2', 'NO_2_NSL', 'NO_3', 'NO_4', 'NO_5', 'PL', 'PT', 'RO', 'RS', 'SE_1', 'SE_2', 'SE_3', 'SE_4', 'SI', 'SK']]
+    filtered_time_steps = [t for t in time_steps]
     logger.info(f"Selected {len(filtered_markets)} markets and {len(filtered_time_steps)} time steps in {time.time() - start_time:.2f} seconds")
 
-    # Run optimization
     try:
-        dispatch_results, revenue_results = run_optimization(
-            time_steps=filtered_time_steps,
-            markets=filtered_markets,
-            total_power_MW=1.0
+        # Calculate chunk size and create chunks
+        chunk_size = calculate_chunk_size(
+            total_timesteps=len(filtered_time_steps),
+            num_markets=len(filtered_markets),
+            target_chunk_size=50000
         )
+        time_chunks = create_time_chunks(filtered_time_steps, chunk_size)
+        
+        logger.info(f"Split problem into {len(time_chunks)} chunks of {chunk_size} timesteps each")
+
+        # Prepare arguments for multiprocessing
+        chunk_args = [(chunk, filtered_markets, 1.0) for chunk in time_chunks]
+        # Add verbose flag to each argument tuple
+        chunk_args_with_verbose = [(args, verbose) for args in chunk_args]
+        
+        # Run parallel optimization with progress bar
+        start_time = time.time()
+        with Pool() as pool:
+            chunk_results = list(tqdm(
+                pool.imap(process_chunk_with_verbose, chunk_args_with_verbose),
+                total=len(chunk_args),
+                desc="Processing chunks",
+                unit="chunk"
+            ))
+        logger.info(f"Parallel optimization completed in {time.time() - start_time:.2f} seconds")
+        
+        # Combine results
+        start_time = time.time()
+        dispatch_results = pd.concat([r[0] for r in chunk_results])
+        revenue_results = pd.concat([r[1] for r in chunk_results])
+        logger.info(f"Results concatenation completed in {time.time() - start_time:.2f} seconds")
         
         # Save results
         save_results(dispatch_results, revenue_results)
